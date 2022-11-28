@@ -39,9 +39,12 @@ union pca_rule
     } fields;
 };
 
+static int ftl_gc(void);
+
 PCA_RULE curr_pca;
 
 unsigned int* L2P;
+unsigned int* gc_nandid;
 
 static int ssd_resize(size_t new_size)
 {
@@ -162,20 +165,21 @@ static unsigned int get_next_pca()
     {
         //full ssd, no pca can allocate
         printf("No new PCA\n");
+        ftl_gc();
         return FULL_PCA;
     }
 
-    if ( curr_pca.fields.nand == PHYSICAL_NAND_NUM - 1)
+    if ( curr_pca.fields.lba == 20 - 1) // 20 is PHYSICAL_LBA_NUM
     {
-        curr_pca.fields.lba += 1;
+        curr_pca.fields.nand += 1;
     }
-    curr_pca.fields.nand = (curr_pca.fields.nand + 1 ) % PHYSICAL_NAND_NUM;
-
+    curr_pca.fields.lba = (curr_pca.fields.lba + 1 ) % 20;
 
     if ( curr_pca.fields.lba >= (NAND_SIZE_KB * 1024 / 512) )
     {
         printf("No new PCA\n");
         curr_pca.pca = FULL_PCA;
+        ftl_gc();
         return FULL_PCA;
     }
     else
@@ -205,12 +209,15 @@ static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
 {
     /*  only simple write, need to consider other cases  */
     PCA_RULE pca;
-    pca.pca = get_next_pca();
+    int ret;
 
-    if (nand_write( buf, pca.pca) > 0)
+    //ftl_gc();
+    pca.pca = get_next_pca();
+    ret = nand_write(buf, pca.pca);
+    if (ret > 0)
     {
         L2P[lba] = pca.pca;
-        return 512 ;
+        return ret;
     }
     else
     {
@@ -219,7 +226,48 @@ static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
     }
 }
 
+static int ftl_gc(void){
+    int blockid, minv, valid;
+    char* buf;
+    PCA_RULE target_pca;
 
+    //find the block with min valid
+    minv = NAND_SIZE_KB * 1024;
+    for (blockid = 0; blockid < PHYSICAL_NAND_NUM; blockid ++)
+    {
+        valid = 0;
+        for (int i = 0; i < NAND_SIZE_KB * 1024 / 512; i ++)
+        {
+            if (L2P[blockid * (NAND_SIZE_KB * 1024 / 512) + i] != INVALID_PCA)
+            {
+                valid ++;
+            }
+        }
+        if (valid < minv)
+        {
+            minv = valid;
+            target_pca.fields.nand = blockid;
+        }
+    }
+
+    //erase the block
+    nand_erase(target_pca.fields.nand);
+
+    //copy data
+    buf = (char)malloc(512);
+
+    for (int i = 0; i < NAND_SIZE_KB * 1024 / 512; i ++)
+    {
+        if (L2P[target_pca.fields.nand * (NAND_SIZE_KB * 1024 / 512) + i] != INVALID_PCA)
+        {
+            nand_read(buf, target_pca.fields.nand * (NAND_SIZE_KB * 1024 / 512) + i);
+            nand_write(buf, get_next_pca());
+        }
+    }
+
+    free(buf);
+    return 0;
+}
 
 static int ssd_file_type(const char* path)
 {
@@ -314,10 +362,12 @@ static int ssd_read(const char* path, char* buf, size_t size,
     }
     return ssd_do_read(buf, size, offset);
 }
+#define PAGESIZE 512
 static int ssd_do_write(const char* buf, size_t size, off_t offset)
 {
     int tmp_lba, tmp_lba_range, process_size;
     int idx, curr_size, remain_size, rst;
+    char* tmp_buf;
 
     host_write_size += size;
     if (ssd_expand(offset + size) != 0)
@@ -327,14 +377,25 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
 
     tmp_lba = offset / 512;
     tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
+    tmp_buf = calloc(512, sizeof(char));
 
     process_size = 0;
     remain_size = size;
     curr_size = 0;
+
     for (idx = 0; idx < tmp_lba_range; idx++)
     {
+        off_t off;
+        int wsize;
+
+        off = (offset + curr_size) % 512;
+        if (remain_size > 512 - off)
+            wsize = 512 - off;
+        else
+            wsize = remain_size;
+
         /*  example only align 512, need to implement other cases  */
-        if(offset % 512 == 0 && size % 512 == 0)
+        if(wsize == PAGESIZE)
         {
             rst = ftl_write(buf + process_size, 1, tmp_lba + idx);
             if ( rst == 0 )
@@ -353,10 +414,42 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
             offset += 512;
         }
         else{
-            printf(" --> Not align 512 !!!");
-            return -EINVAL;
+            // Not align 512
+            // Partial overwrite
+            
+            //Read
+            rst = ftl_read(tmp_buf, tmp_lba + idx);
+
+            if (rst == 0){
+                return -ENOMEM;
+            }
+            else if (rst < 0){
+                return rst;
+            }
+            
+            //Modify
+            memcpy(&tmp_buf[off], &buf[curr_size], wsize);
+
+            //Write
+            rst = ftl_write(tmp_buf, 1, tmp_lba + idx);
+
+            if (rst == 0){
+                return -ENOMEM;
+            }
+            else if (rst < 0){
+                return rst;
+            }
+
+            curr_size += wsize;
+            remain_size -= wsize;
+            process_size += wsize;
+            offset += wsize;
+            //printf(" --> Not align 512 !!!");
+            //return -EINVAL;
         }
     }
+    
+    free(tmp_buf);
 
     return size;
 }

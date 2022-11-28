@@ -13,7 +13,7 @@
 #define NAND_SIZE_KB (10)
 #define INVALID_PCA     (0xFFFFFFFF)
 #define FULL_PCA     (0xFFFFFFFE)
-#define NAND_LOCATION  "/home/brian/lab_fuse/ssd"
+#define NAND_LOCATION  "/home/s102345/Desktop/1101_OS_Phison/lab"
 
 enum
 {
